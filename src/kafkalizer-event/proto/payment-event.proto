@@ -1,0 +1,7 @@
+syntax = "proto3";
+message PaymentEvent {
+  string user_id = 1;
+  float amount = 2;
+  string payment_method = 3;
+  bool is_block = 4;
+};

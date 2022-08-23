@@ -1,0 +1,481 @@
+---
+name: Release Flow
+
+on:  # yamllint disable-line rule:truthy
+  workflow_dispatch:
+    inputs:
+      releaseCanditateVersion:
+        description: 'Name of version (ie v5.5.0-rc.0)'
+        required: true
+
+env:
+  SLACK_CHANNEL: deploys
+  SLACK_CHANNEL_PRD: deploys_prd
+  NODE_VERSION: '16.13.0'
+
+jobs:
+  init_workflow:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Post to a Slack channel
+        id: slack
+        uses: someimportantcompany/github-actions-slack-message@v1
+        with:
+          webhook-url: ${{ secrets.SLACK_WEBHOOK_URL }}
+          channel: ${{ env.SLACK_CHANNEL }}
+          text: "[STG] GitHub Action: Build Start - ${{github.event.inputs.releaseCanditateVersion}}"
+          color: good
+
+  unit_test:
+    runs-on: ubuntu-latest
+    needs: ['init_workflow']
+    # Service containers to run with `runner-job`
+    services:
+      # Label used to access the service container
+      postgres:
+        # Docker Hub image
+        image: postgres
+        # Provide the password for postgres
+        env:
+          POSTGRES_PASSWORD: postgres
+        # Set health checks to wait until postgres has started
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          # Maps tcp port 5432 on service container to the host
+          - 5432:5432
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2.4.0
+        with:
+          fetch-depth: 0
+      - name: Setup Node
+        uses: actions/setup-node@v2
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          registry-url: 'https://npm.pkg.github.com'
+          scope: '@yaperos'
+      - name: Unit Test
+        id: unit-test
+        run: |
+          npm install
+          npm run test:unit
+        env:
+          DATABASE_URL: "postgresql://postgres:postgres@localhost:5432/userdb?schema=public"
+          NODE_AUTH_TOKEN: ${{ secrets.GH_PAT }}
+      - name: Slack Failed Notification
+        uses: someimportantcompany/github-actions-slack-message@v1
+        if: failure()
+        with:
+          webhook-url: ${{ secrets.SLACK_WEBHOOK_URL }}
+          channel: ${{ env.SLACK_CHANNEL }}
+          text: "[STG] GitHub Action: Build failed in step ${{github.job}}"
+          color: failure
+
+  security_test:
+    if: ${{ false }}  # disable for now
+    runs-on: ubuntu-latest
+    needs: ['init_workflow']
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2.4.0
+        with:
+          fetch-depth: 0
+      - name: Setup Node
+        uses: actions/setup-node@v2
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          registry-url: 'https://npm.pkg.github.com'
+          scope: '@yaperos'
+      - name: Security Test
+        id: security-test
+        run: |
+          npm install
+          npm run test:sec
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GH_PAT }}
+      - name: Slack Failed Notification
+        uses: someimportantcompany/github-actions-slack-message@v1
+        if: failure()
+        with:
+          webhook-url: ${{ secrets.SLACK_WEBHOOK_URL }}
+          channel: ${{ env.SLACK_CHANNEL }}
+          text: "[STG] GitHub Action: Build failed in step ${{github.job}}"
+          color: failure
+
+  build:
+    environment:
+      name: stagging
+    runs-on: ubuntu-latest
+    # needs: ['unit_test', 'security_test'] #security_test disable for now
+    needs: ['unit_test']
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2.4.0
+        with:
+          fetch-depth: 0
+      - name: Conteiner Registry Login
+        uses: azure/docker-login@v1
+        with:
+          login-server: acryape3eastus${{ secrets.ENVIRONMENT }}.azurecr.io
+          username: ${{ secrets.AZURE_ACR_USERNAME_STG }}
+          password: ${{ secrets.AZURE_ACR_PASSWORD_STG }}
+      - name: Container Build and Push
+        uses: docker/build-push-action@v2.7.0
+        with:
+          tags: "acryape3eastus${{ secrets.ENVIRONMENT }}.azurecr.io/${{ github.event.repository.name }}-${{ secrets.ENVIRONMENT }}:${{ github.event.inputs.releaseCanditateVersion }}"  # yamllint disable-line rule:line-length
+          push: true
+          build-args: |
+            NODE_AUTH_TOKEN=${{ secrets.GH_PAT }}
+      - name: Slack Failed Notification
+        uses: someimportantcompany/github-actions-slack-message@v1
+        if: failure()
+        with:
+          webhook-url: ${{ secrets.SLACK_WEBHOOK_URL }}
+          channel: ${{ env.SLACK_CHANNEL }}
+          text: "[STG] GitHub Action: Build failed in step ${{github.job}}"
+          color: failure
+
+  deploy:
+    environment:
+      name: stagging
+    runs-on: ubuntu-latest
+    needs: ['build']
+    outputs:
+      stg_last_version: ${{ steps.get_latest_tag.outputs.tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2.4.0
+        with:
+          fetch-depth: 0
+      - name: Setup Helm Version
+        uses: azure/setup-helm@v1
+        with:
+          version: v3.6.3
+      - name: Help Add Repo
+        run: |
+          helm repo add yape-charts --username Yaperos --password ${{ secrets.GH_PAT }} https://raw.githubusercontent.com/yaperos/helm-charts/main/
+      - name: Azure Connetion AKS
+        uses: azure/aks-set-context@v1.1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS_STG }}
+          resource-group: ${{ secrets.AZURE_RESOURCE_GROUP_STG }}
+          cluster-name: aks-yape3-eastus-${{ secrets.ENVIRONMENT }}
+      # yamllint disable rule:line-length
+      - name: Helm Deploy
+        run: |
+          helm upgrade --install ${{ github.event.repository.name }} --namespace ${{ secrets.AKS_NAMESPACE }} yape-charts/yape-default \
+          --atomic --cleanup-on-fail --version 0.4.1 \
+          --values infra/helm/values.yaml \
+          --set-string container.image.name=acryape3eastus${{ secrets.ENVIRONMENT }}.azurecr.io/${{ github.event.repository.name }}-${{ secrets.ENVIRONMENT }} \
+          --set-string container.image.tag=${{ github.event.inputs.releaseCanditateVersion }} \
+          --set-string privateRegistry.enabled=true \
+          --set-string privateRegistry.credentials.url=acryape3eastus${{ secrets.ENVIRONMENT }}.azurecr.io \
+          --set-string privateRegistry.credentials.username=${{ secrets.AZURE_ACR_USERNAME_STG }} \
+          --set-string privateRegistry.credentials.password=${{ secrets.AZURE_ACR_PASSWORD_STG }} \
+          --set ingresses[0].ingressClassName=ingress-${{ secrets.AKS_NAMESPACE }} \
+          --set ingresses[0].annotations.nginx\\.ingress\\.kubernetes\\.io/cors-allow-origin="https://\\*\\.stg\\.yape\\.com\\.pe\\,https://\\*\\.stg\\.yape\\.tech" \
+          --set ingresses[0].hosts=app_name.stg.yape.tech \
+          --set ingresses[0].tls[0].hosts[0]=app_name.stg.yape.tech \
+          --set ingresses[0].tls[0].secretName=stg-yape-tech-tls
+      # yamllint enable rule:line-length
+      - name: Get Last Tag
+        uses: actions-ecosystem/action-get-latest-tag@v1
+        id: get_latest_tag
+        with:
+          semver_only: true
+      - name: Push new Tag ReleaseCandidate
+        run: |
+          tag=${{ github.event.inputs.releaseCanditateVersion }}
+          message='${{ github.event.inputs.releaseCanditateVersion }}'
+          git config user.name "${GITHUB_ACTOR}"
+          git config user.email "${GITHUB_ACTOR}@users.noreply.github.com"
+          git tag -a "${tag}" -m "${message}"
+          git push origin "${tag}"
+      - name: Slack Failed Notification
+        uses: someimportantcompany/github-actions-slack-message@v1
+        if: failure()
+        with:
+          webhook-url: ${{ secrets.SLACK_WEBHOOK_URL }}
+          channel: ${{ env.SLACK_CHANNEL }}
+          text: "[STG] GitHub Action: Build failed in step ${{github.job}}"
+          color: failure
+
+  automationTest:
+    runs-on: ubuntu-latest
+    needs: ['deploy']
+    outputs:
+      stg_last_version: ${{ needs.deploy.outputs.stg_last_version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2.4.0
+        with:
+          fetch-depth: 0
+      - name: Setup Node
+        uses: actions/setup-node@v2
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          registry-url: 'https://npm.pkg.github.com'
+          scope: '@yaperos'
+      - name: e2e Test
+        id: e2e-test
+        run: |
+          npm install
+          npm run test:e2e
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GH_PAT }}
+      - name: Slack Failed Notification
+        uses: someimportantcompany/github-actions-slack-message@v1
+        if: failure()
+        with:
+          webhook-url: ${{ secrets.SLACK_WEBHOOK_URL }}
+          channel: ${{ env.SLACK_CHANNEL }}
+          text: "[STG] GitHub Action: Build failed in step ${{github.job}}"
+          color: failure
+
+  generatePreRelease:
+    runs-on: ubuntu-latest
+    needs: ['automationTest']
+    steps:
+      - uses: actions/checkout@v2.4.0
+        with:
+          fetch-depth: 0
+      - name: Build Changelog
+        id: changelog_stg
+        uses: metcalfc/changelog-generator@v3.0.0
+        with:
+          myToken: ${{ secrets.GITHUB_TOKEN }}
+          head-ref: ${{ github.event.inputs.releaseCanditateVersion }}
+          base-ref: ${{ needs.automationTest.outputs.stg_last_version }}
+      - name: Create PreRelease
+        uses: actions/create-release@v1
+        with:
+          prerelease: true
+          tag_name: ${{ github.event.inputs.releaseCanditateVersion }}
+          release_name: ${{ github.event.inputs.releaseCanditateVersion }}
+          body: |
+            Actor: ${{ github.actor }}
+            ActionRunner: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+            ${{ steps.changelog_stg.outputs.changelog }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Slack send changelog
+        id: slack
+        uses: someimportantcompany/github-actions-slack-message@v1
+        with:
+          webhook-url: ${{ secrets.SLACK_WEBHOOK_URL }}
+          channel: ${{ env.SLACK_CHANNEL }}
+          text: "[STG] GitHub Action: Build Sucess - ${{github.repository}} #${{github.run_id}}\n\n${{ steps.changelog_stg.outputs.changelog }}"
+          color: good
+      - name: Slack Failed Notification
+        uses: someimportantcompany/github-actions-slack-message@v1
+        if: failure()
+        with:
+          webhook-url: ${{ secrets.SLACK_WEBHOOK_URL }}
+          channel: ${{ env.SLACK_CHANNEL }}
+          text: "[STG] GitHub Action: Build failed in step ${{github.job}}"
+          color: failure
+
+  promotePRD:
+    environment:
+      name: promotePRD
+    runs-on: ubuntu-latest
+    needs: ['generatePreRelease']
+    steps:
+      - name: Slack Notification - Request Approved
+        uses: someimportantcompany/github-actions-slack-message@v1
+        with:
+          webhook-url: ${{ secrets.SLACK_WEBHOOK_URL }}
+          channel: ${{ env.SLACK_CHANNEL_PRD }}
+          text: "[PRD] GitHub Action: Build waiting approved - ${{github.event.inputs.releaseCanditateVersion}}"
+          color: warning
+
+  buildPRD:
+    environment:
+      name: production
+    runs-on: ubuntu-latest
+    needs: ['promotePRD']
+    outputs:
+      new_version: ${{ steps.get_tag_version.outputs.new_version }}
+    steps:
+      - uses: actions/checkout@v2.4.0
+        with:
+          fetch-depth: 0
+      - name: Get NewVersion TAG
+        run: echo "::set-output name=new_version::$(echo ${{ github.event.inputs.releaseCanditateVersion }} |awk -F'-' '{ print $1 }')"
+        id: get_tag_version
+      - name: Conteiner Registry Login
+        uses: azure/docker-login@v1
+        with:
+          login-server: acryape3eastus${{ secrets.ENVIRONMENT }}.azurecr.io
+          username: ${{ secrets.AZURE_ACR_USERNAME_PRD }}
+          password: ${{ secrets.AZURE_ACR_PASSWORD_PRD }}
+      - name: Container Build and Push
+        uses: docker/build-push-action@v2.7.0
+        with:
+          tags: "acryape3eastus${{ secrets.ENVIRONMENT }}.azurecr.io/${{ github.event.repository.name }}-${{ secrets.ENVIRONMENT }}:${{ steps.get_tag_version.outputs.new_version }}"  # yamllint disable-line rule:line-length
+          push: true
+          build-args: |
+            NODE_AUTH_TOKEN=${{ secrets.GH_PAT }}
+      - name: Slack Failed Notification
+        uses: someimportantcompany/github-actions-slack-message@v1
+        if: failure()
+        with:
+          webhook-url: ${{ secrets.SLACK_WEBHOOK_URL }}
+          channel: ${{ env.SLACK_CHANNEL_PRD }}
+          text: "[PRD] GitHub Action: Build failed in step ${{github.job}}"
+          color: failure
+
+  deployPRD:
+    environment:
+      name: production
+    runs-on: ubuntu-latest
+    needs: ['buildPRD']
+    outputs:
+      new_release_version: ${{ needs.buildPRD.outputs.new_version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2.4.0
+        with:
+          fetch-depth: 0
+      - name: Setup Helm Version
+        uses: azure/setup-helm@v1
+        with:
+          version: v3.6.3
+      - name: Help Add Repo
+        run: |
+          helm repo add yape-charts --username Yaperos --password ${{ secrets.GH_PAT }} https://raw.githubusercontent.com/yaperos/helm-charts/main/
+      - name: Azure Connetion AKS
+        uses: azure/aks-set-context@v1.1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS_PRD }}
+          resource-group: ${{ secrets.AZURE_RESOURCE_GROUP_PRD }}
+          cluster-name: aks-yape3-eastus-${{ secrets.ENVIRONMENT }}
+      # yamllint disable rule:line-length
+      - name: Helm Deploy
+        run: |
+          helm upgrade --install ${{ github.event.repository.name }} --namespace ${{ secrets.AKS_NAMESPACE }} yape-charts/yape-default \
+          --atomic --cleanup-on-fail --version 0.4.1 \
+          --values infra/helm/values.yaml \
+          --set-string container.image.name=acryape3eastus${{ secrets.ENVIRONMENT }}.azurecr.io/${{ github.event.repository.name }}-${{ secrets.ENVIRONMENT }} \
+          --set-string container.image.tag=${{ needs.buildPRD.outputs.new_version }} \
+          --set-string privateRegistry.enabled=true \
+          --set-string privateRegistry.credentials.url=acryape3eastus${{ secrets.ENVIRONMENT }}.azurecr.io \
+          --set-string privateRegistry.credentials.username=${{ secrets.AZURE_ACR_USERNAME_PRD }} \
+          --set-string privateRegistry.credentials.password=${{ secrets.AZURE_ACR_PASSWORD_PRD }} \
+          --set ingresses[0].annotations.nginx\\.ingress\\.kubernetes\\.io/cors-allow-origin="https://\\*\\.yape\\.com\\.pe\\,https://\\*\\.yape\\.tech" \
+          --set ingresses[0].ingressClassName=ingress-${{ secrets.AKS_NAMESPACE }} \
+          --set ingresses[0].hosts=app_name.yape.tech \
+          --set ingresses[0].tls[0].hosts[0]=app_name.yape.tech \
+          --set ingresses[0].tls[0].secretName=yape-tech-tls \
+          --set container.replicas=5 \
+          --set hpa.maxReplicas=20
+      # yamllint enable rule:line-length
+      - name: Push new Tag
+        run: |
+          tag=${{ needs.buildPRD.outputs.new_version }}
+          message='${{ needs.buildPRD.outputs.new_version }}'
+          git config user.name "${GITHUB_ACTOR}"
+          git config user.email "${GITHUB_ACTOR}@users.noreply.github.com"
+          git tag -a "${tag}" -m "${message}"
+          git push origin "${tag}"
+      - name: Slack Failed Notification
+        uses: someimportantcompany/github-actions-slack-message@v1
+        if: failure()
+        with:
+          webhook-url: ${{ secrets.SLACK_WEBHOOK_URL }}
+          channel: ${{ env.SLACK_CHANNEL_PRD }}
+          text: "[PRD] GitHub Action: Build failed in step ${{github.job}}"
+          color: failure
+
+  automationTestPRD:
+    runs-on: ubuntu-latest
+    needs: ['deployPRD']
+    outputs:
+      new_release_version: ${{ needs.deployPRD.outputs.new_release_version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2.4.0
+        with:
+          fetch-depth: 0
+      - name: Setup Node
+        uses: actions/setup-node@v2
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          registry-url: 'https://npm.pkg.github.com'
+          scope: '@yaperos'
+      - name: e2e Test
+        id: e2e-test
+        run: |
+          npm install
+          npm run test:e2e
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GH_PAT }}
+      - name: Slack Failed Notification
+        uses: someimportantcompany/github-actions-slack-message@v1
+        if: failure()
+        with:
+          webhook-url: ${{ secrets.SLACK_WEBHOOK_URL }}
+          channel: ${{ env.SLACK_CHANNEL_PRD }}
+          text: "[PRD] GitHub Action: Build failed in step ${{github.job}}"
+          color: failure
+
+  generateRelease:
+    environment:
+      name: production
+    runs-on: ubuntu-latest
+    needs: ['automationTestPRD']
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2.4.0
+        with:
+          fetch-depth: 0
+      - name: Get Last Release
+        id: get_latest_release
+        uses: rez0n/actions-github-release@main
+        env:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
+          type: "stable"
+      - name: DEBUG - Print Release
+        run: |
+          echo "New: ${{ needs.automationTestPRD.outputs.new_release_version }}"
+          echo "Last: ${{ steps.get_latest_release.outputs.release }}"
+      - name: Build Changelog
+        id: changelog_prd
+        uses: metcalfc/changelog-generator@v3.0.0
+        with:
+          myToken: ${{ secrets.GITHUB_TOKEN }}
+          head-ref: ${{ needs.automationTestPRD.outputs.new_release_version }}
+          base-ref: ${{ steps.get_latest_release.outputs.release }}
+      - name: Create Release
+        uses: actions/create-release@v1
+        with:
+          tag_name: ${{ needs.automationTestPRD.outputs.new_release_version  }}
+          release_name: 'Release ${{ needs.automationTestPRD.outputs.new_release_version }}'
+          body: |
+            Actor: ${{ github.actor }}
+            ActionRunner: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+            Changelog:
+            ${{ steps.changelog_prd.outputs.changelog }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Slack Notification
+        id: slack
+        uses: someimportantcompany/github-actions-slack-message@v1
+        with:
+          webhook-url: ${{ secrets.SLACK_WEBHOOK_URL }}
+          channel: ${{ env.SLACK_CHANNEL }}
+          text: "[PRD] GitHub Action: Build Sucess - ${{github.repository}} #${{github.run_id}}\n\n${{ steps.changelog_prd.outputs.changelog }}"
+          color: good
+      - name: Slack Failed Notification
+        uses: someimportantcompany/github-actions-slack-message@v1
+        if: failure()
+        with:
+          webhook-url: ${{ secrets.SLACK_WEBHOOK_URL }}
+          channel: ${{ env.SLACK_CHANNEL_PRD }}
+          text: "[PRD] GitHub Action: Build failed in step ${{github.job}}"
+          color: failure

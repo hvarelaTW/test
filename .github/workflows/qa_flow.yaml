@@ -1,0 +1,304 @@
+---
+name: QA Flow
+
+on: workflow_dispatch  # yamllint disable-line rule:truthy
+
+# If it is a real service use the structure below
+# on:  # yamllint disable-line rule:truthy
+#   push:
+#     branches:
+#       - main
+
+env:
+  SLACK_CHANNEL: deploys
+  NODE_VERSION: '16.13.0'
+
+jobs:
+  init_workflow:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2.4.0
+        with:
+          fetch-depth: 0
+      - name: Get hash commit
+        id: hash_commit
+        shell: bash
+        run: |
+          echo "::set-output name=sha_short::$(git rev-parse --short HEAD)"
+      - name: Post to a Slack channel
+        id: slack
+        uses: someimportantcompany/github-actions-slack-message@v1
+        with:
+          webhook-url: ${{ secrets.SLACK_WEBHOOK_URL }}
+          channel: ${{ env.SLACK_CHANNEL }}
+          text: "[QA] GitHub Action: Build Start - ${{ steps.hash_commit.outputs.sha_short }}"
+          color: good
+
+  unit_test:
+    runs-on: ubuntu-latest
+    needs: ['init_workflow']
+    # Service containers to run with `runner-job`
+    services:
+      # Label used to access the service container
+      postgres:
+        # Docker Hub image
+        image: postgres
+        # Provide the password for postgres
+        env:
+          POSTGRES_PASSWORD: ${{vault_pass}}
+        # Set health checks to wait until postgres has started
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          # Maps tcp port 5432 on service container to the host
+          - 5432:5432
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2.4.0
+        with:
+          fetch-depth: 0
+      - name: Setup Node
+        uses: actions/setup-node@v2
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          registry-url: 'https://npm.pkg.github.com'
+          scope: '@yaperos'
+      - name: Unit Test
+        id: unit-test
+        run: |
+          npm install
+          npm run test:unit
+        env:
+          DATABASE_URL: "postgresql://postgres:postgres@localhost:5432/userdb?schema=public"
+          NODE_AUTH_TOKEN: ${{ secrets.GH_PAT }}
+      - name: Slack Failed Notification
+        uses: someimportantcompany/github-actions-slack-message@v1
+        if: failure()
+        with:
+          webhook-url: ${{ secrets.SLACK_WEBHOOK_URL }}
+          channel: ${{ env.SLACK_CHANNEL }}
+          text: "[QA] GitHub Action: Build failed in step ${{github.job}}"
+          color: failure
+
+  e2e_test:
+    runs-on: ubuntu-latest
+    needs: ['yaml_lint', 'markdown_lint', 'docker_lint', 'eslint_lint', 'build']
+    # Service containers to run with `runner-job`
+    services:
+      # Label used to access the service container
+      postgres:
+        # Docker Hub image
+        image: postgres
+        # Provide the password for postgres
+        env:
+          POSTGRES_PASSWORD: postgres
+        # Set health checks to wait until postgres has started
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          # Maps tcp port 5432 on service container to the host
+          - 5432:5432
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2.4.0
+        with:
+          fetch-depth: 0
+      - name: Setup Node
+        uses: actions/setup-node@v2
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          registry-url: 'https://npm.pkg.github.com'
+          scope: '@yaperos'
+      - name: e2e Test
+        id: e2e-test
+        run: |
+          npm install
+          npm run test:e2e
+        env:
+          DATABASE_URL: "postgresql://postgres:postgres@localhost:5432/userdb?schema=public"
+          NODE_AUTH_TOKEN: ${{ secrets.GH_PAT }}
+
+  security_test:
+    if: ${{ false }}  # disable for now
+    runs-on: ubuntu-latest
+    needs: ['init_workflow']
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2.4.0
+        with:
+          fetch-depth: 0
+      - name: Setup Node
+        uses: actions/setup-node@v2
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          registry-url: 'https://npm.pkg.github.com'
+          scope: '@yaperos'
+      - name: Security Test
+        id: security-test
+        run: |
+          npm install
+          npm run test:sec
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GH_PAT }}
+      - name: Slack Failed Notification
+        uses: someimportantcompany/github-actions-slack-message@v1
+        if: failure()
+        with:
+          webhook-url: ${{ secrets.SLACK_WEBHOOK_URL }}
+          channel: ${{ env.SLACK_CHANNEL }}
+          text: "[QA] GitHub Action: Build failed in step ${{github.job}}"
+          color: failure
+
+  build:
+    environment:
+      name: qa
+    runs-on: ubuntu-latest
+    # needs: ['unit_test', 'security_test'] #security_test disable for now
+    needs: ['unit_test']
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2.4.0
+        with:
+          fetch-depth: 0
+      - name: Get hash commit
+        id: hash_commit
+        shell: bash
+        run: |
+          echo "::set-output name=sha_short::$(git rev-parse --short HEAD)"
+      - name: Conteiner Registry Login
+        uses: azure/docker-login@v1
+        with:
+          login-server: acryape3eastus${{ secrets.ENVIRONMENT }}.azurecr.io
+          username: ${{ secrets.AZURE_ACR_USERNAME_QA }}
+          password: ${{ secrets.AZURE_ACR_PASSWORD_QA }}
+      - name: Container Build and Push
+        uses: docker/build-push-action@v2.7.0
+        with:
+          tags: "acryape3eastus${{ secrets.ENVIRONMENT }}.azurecr.io/${{ github.event.repository.name }}-${{ secrets.ENVIRONMENT }}:${{ steps.hash_commit.outputs.sha_short }}"  # yamllint disable-line rule:line-length
+          push: false  # If it is a real service set to 'true'
+          build-args: |
+            NODE_AUTH_TOKEN=${{ secrets.GH_PAT }}
+      - name: Slack Failed Notification
+        uses: someimportantcompany/github-actions-slack-message@v1
+        if: failure()
+        with:
+          webhook-url: ${{ secrets.SLACK_WEBHOOK_URL }}
+          channel: ${{ env.SLACK_CHANNEL }}
+          text: "[QA] GitHub Action: Build failed in step ${{github.job}}"
+          color: failure
+
+  deploy:
+    environment:
+      name: qa
+    runs-on: ubuntu-latest
+    needs: ['build']
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2.4.0
+        with:
+          fetch-depth: 0
+      - name: Get hash commit
+        id: hash_commit
+        shell: bash
+        run: |
+          echo "::set-output name=sha_short::$(git rev-parse --short HEAD)"
+      - name: Setup Helm Version
+        uses: azure/setup-helm@v1
+        with:
+          version: v3.6.3
+      - name: Help Add Repo
+        run: |
+          helm repo add yape-charts --username Yaperos --password ${{ secrets.GH_PAT }} https://raw.githubusercontent.com/yaperos/helm-charts/main/
+      - name: Azure Connetion AKS
+        uses: azure/aks-set-context@v1.1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS_QA }}
+          resource-group: ${{ secrets.AZURE_RESOURCE_GROUP_QA }}
+          cluster-name: aks-yape3-eastus-${{ secrets.ENVIRONMENT }}
+      # yamllint disable rule:line-length
+      # If it is a real service, remove '--dry-run' option
+      - name: Helm Deploy
+        run: |
+          helm upgrade --install ${{ github.event.repository.name }} --namespace ${{ secrets.AKS_NAMESPACE }} yape-charts/yape-default \
+          --atomic --cleanup-on-fail --version 0.4.1 \
+          --values infra/helm/values.yaml \
+          --set-string container.image.name=acryape3eastus${{ secrets.ENVIRONMENT }}.azurecr.io/${{ github.event.repository.name }}-${{ secrets.ENVIRONMENT }} \
+          --set-string container.image.tag=${{ steps.hash_commit.outputs.sha_short }} \
+          --set-string privateRegistry.enabled=true \
+          --set-string privateRegistry.credentials.url=acryape3eastus${{ secrets.ENVIRONMENT }}.azurecr.io \
+          --set-string privateRegistry.credentials.username=${{ secrets.AZURE_ACR_USERNAME_QA }} \
+          --set-string privateRegistry.credentials.password=${{ secrets.AZURE_ACR_PASSWORD_QA }} \
+          --set ingresses[0].ingressClassName=ingress-${{ secrets.AKS_NAMESPACE }} \
+          --set ingresses[0].annotations.nginx\\.ingress\\.kubernetes\\.io/cors-allow-origin="https://\\*\\.qa\\.yape\\.com\\.pe\\,https://\\*\\.qa\\.yape\\.tech" \
+          --set ingresses[0].hosts=app_name.qa.yape.tech \
+          --set ingresses[0].tls[0].hosts[0]=app_name.qa.yape.tech \
+          --set ingresses[0].tls[0].secretName=qa-yape-tech-tls --dry-run
+      # yamllint enable rule:line-length
+      - name: Slack Failed Notification
+        uses: someimportantcompany/github-actions-slack-message@v1
+        if: failure()
+        with:
+          webhook-url: ${{ secrets.SLACK_WEBHOOK_URL }}
+          channel: ${{ env.SLACK_CHANNEL }}
+          text: "[QA] GitHub Action: Build failed in step ${{github.job}}"
+          color: failure
+
+  automationTest:
+    runs-on: ubuntu-latest
+    needs: ['deploy']
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2.4.0
+        with:
+          fetch-depth: 0
+      - name: Get hash commit
+        id: hash_commit
+        shell: bash
+        run: |
+          echo "::set-output name=sha_short::$(git rev-parse --short HEAD)"
+      - name: Setup Node
+        uses: actions/setup-node@v2
+        with:
+          node-version: '16.13.0'
+      - name: e2e Test
+        id: e2e-test
+        run: |
+          npm install
+          npm run test:e2e
+      - name: Slack Failed Notification
+        uses: someimportantcompany/github-actions-slack-message@v1
+        if: failure()
+        with:
+          webhook-url: ${{ secrets.SLACK_WEBHOOK_URL }}
+          channel: ${{ env.SLACK_CHANNEL }}
+          text: "[QA] GitHub Action: Build failed in step ${{github.job}}"
+          color: failure
+
+  end_workflow:
+    runs-on: ubuntu-latest
+    needs: ['automationTest']
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2.4.0
+        with:
+          fetch-depth: 0
+      - name: Get hash commit
+        id: hash_commit
+        shell: bash
+        run: |
+          echo "::set-output name=sha_short::$(git rev-parse --short HEAD)"
+      - name: Post to a Slack channel
+        id: slack
+        uses: someimportantcompany/github-actions-slack-message@v1
+        with:
+          webhook-url: ${{ secrets.SLACK_WEBHOOK_URL }}
+          channel: ${{ env.SLACK_CHANNEL }}
+          text: "[QA] GitHub Action: Build Sucess - ${{ steps.hash_commit.outputs.sha_short }}"
+          color: good
