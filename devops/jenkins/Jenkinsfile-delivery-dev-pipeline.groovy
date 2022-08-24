@@ -6,7 +6,7 @@ pipeline {
     stages {
         stage('Hello') {
             steps {
-                echo  env.BRANCH_NAME
+                echo 'Pulling...' + env.BRANCH_NAME
                 echo 'Hello World Yape!!!!'
             }
         }
