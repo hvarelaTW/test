@@ -8,6 +8,7 @@ pipeline {
             steps {
                 echo 'Pulling...' + env.BRANCH_NAME
                 echo 'Hello World Yape!!!!'
+                sh 'printenv'
             }
         }
     }
